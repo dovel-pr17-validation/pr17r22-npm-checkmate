@@ -1,0 +1,116 @@
+const SERVICE_NAME = "EmailProvider";
+import type { Notification } from "@/domain/notifications/notification.type.js";
+import { NotificationProvider } from "@/domain/notifications/providers/INotificationProvider.js";
+import { AppError } from "@/utils/AppError.js";
+import { buildTestEmail } from "@/domain/notifications/providers/utils.js";
+import type { NotificationMessage } from "@/domain/notifications/notification.type.js";
+import type { ILogger } from "@/utils/logger/logger.js";
+import { IEmailService } from "@/service/emailService.js";
+export class EmailProvider extends NotificationProvider {
+	protected readonly serviceName = SERVICE_NAME;
+
+	private emailService: IEmailService;
+
+	constructor(emailService: IEmailService, logger: ILogger) {
+		super(logger);
+		this.emailService = emailService;
+	}
+
+	async sendTestAlert(notification: Partial<Notification>): Promise<boolean> {
+		const subject = "Test notification";
+		const html = await buildTestEmail(this.emailService);
+
+		if (!notification.address) {
+			this.logger.warn("Missing address");
+			return false;
+		}
+
+		if (!html) {
+			this.logger.warn("Failed to build test email content");
+			return false;
+		}
+
+		try {
+			await this.emailService.sendEmail(notification.address, subject, html);
+			return true;
+		} catch (error: unknown) {
+			this.logger.warn({ err: error, details: error instanceof AppError ? error.details : undefined }, "Email test alert failed");
+			if (error instanceof AppError) throw error;
+			return false;
+		}
+	}
+
+	async sendMessage(notification: Notification, message: NotificationMessage): Promise<boolean> {
+		if (!notification.address) {
+			return false;
+		}
+
+		const subject = this.buildSubject(message);
+		const html = await this.buildEmailFromMessage(message);
+
+		if (!html) {
+			this.logger.warn("Failed to build email content");
+			return false;
+		}
+
+		// Providers must resolve to a boolean: NotificationsService fans these out through
+		// Promise.all, so a rejection here would abort the other channels' alerts too.
+		try {
+			await this.emailService.sendEmail(notification.address, subject, html);
+			return true;
+		} catch (error: unknown) {
+			this.logger.warn({ err: error, details: error instanceof AppError ? error.details : undefined }, "Email notification failed");
+			return false;
+		}
+	}
+
+	private buildSubject(message: NotificationMessage): string {
+		switch (message.type) {
+			case "monitor_down":
+				return `Monitor ${message.monitor.name} is down`;
+			case "monitor_up":
+				return `Monitor ${message.monitor.name} is back up`;
+			case "threshold_breach":
+				return `Monitor ${message.monitor.name} threshold exceeded`;
+			case "threshold_resolved":
+				return `Monitor ${message.monitor.name} thresholds resolved`;
+			case "container_breach":
+				return `Monitor ${message.monitor.name} container alert`;
+			case "container_resolved":
+				return `Monitor ${message.monitor.name} containers recovered`;
+			default:
+				return `Alert: ${message.monitor.name}`;
+		}
+	}
+
+	private async buildEmailFromMessage(message: NotificationMessage): Promise<string | undefined> {
+		const context = {
+			title: message.content.title,
+			summary: message.content.summary,
+			monitorName: message.monitor.name,
+			monitorUrl: message.monitor.url,
+			monitorType: message.monitor.type,
+			monitorStatus: message.monitor.status,
+			headerColor: this.getColorForSeverity(message.severity),
+			thresholds: message.content.thresholds,
+			details: message.content.details,
+			incidentUrl: message.content.incident?.url,
+		};
+
+		this.logger.debug({ context }, "Building email from message");
+
+		const html = await this.emailService.buildEmail("unifiedNotificationTemplate", context);
+
+		return html;
+	}
+
+	private getColorForSeverity(severity: string): string {
+		const colorMap: Record<string, string> = {
+			critical: "red",
+			warning: "#f59e0b",
+			info: "#3b82f6",
+			success: "green",
+		};
+		return colorMap[severity] ?? "#3b82f6";
+	}
+}

@@ -1,0 +1,485 @@
+import { describe, expect, it, jest, beforeEach } from "@jest/globals";
+import { EmailService } from "../../../src/service/emailService.ts";
+import { createMockLogger } from "../../helpers/createMockLogger.ts";
+import type { ISettingsService } from "../../../src/domain/app-settings/app-settings.service.ts";
+import type { EmailTransportConfig } from "../../../src/domain/app-settings/app-settings.type.ts";
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const makeTransportConfig = (overrides?: Partial<EmailTransportConfig>): EmailTransportConfig =>
+	({
+		systemEmailHost: "smtp.example.com",
+		systemEmailPort: 587,
+		systemEmailSecure: false,
+		systemEmailPool: false,
+		systemEmailUser: "user@example.com",
+		systemEmailAddress: "noreply@example.com",
+		systemEmailPassword: "password123",
+		systemEmailConnectionHost: "mail.example.com",
+		systemEmailTLSServername: "smtp.example.com",
+		systemEmailIgnoreTLS: false,
+		systemEmailRequireTLS: true,
+		systemEmailRejectUnauthorized: true,
+		...overrides,
+	}) as EmailTransportConfig;
+
+const createMockSettingsService = () =>
+	({
+		getDBSettings: jest.fn().mockResolvedValue(makeTransportConfig()),
+	}) as unknown as jest.Mocked<ISettingsService>;
+
+const createMockFs = (templateContent: string = "<mjml><mj-body></mj-body></mjml>") =>
+	({
+		readFileSync: jest.fn().mockReturnValue(templateContent),
+	}) as any;
+
+const createMockPath = () =>
+	({
+		join: jest.fn((...args: string[]) => args.join("/")),
+		dirname: jest.fn().mockReturnValue("/mock/dir"),
+	}) as any;
+
+const createMockCompile = (result: string = "<mjml>compiled</mjml>") => {
+	const compiledFn = jest.fn().mockReturnValue(result);
+	const compile = jest.fn().mockReturnValue(compiledFn) as any;
+	compile.__compiledFn = compiledFn;
+	return compile;
+};
+
+const createMockMjml = (html: string = "<html>rendered</html>") => jest.fn().mockReturnValue({ html }) as any;
+
+const createMockTransporter = () => ({
+	verify: jest.fn().mockResolvedValue(true),
+	sendMail: jest.fn().mockResolvedValue({ messageId: "msg-123" }),
+});
+
+const createMockNodemailer = (transporter?: ReturnType<typeof createMockTransporter>) => {
+	const t = transporter ?? createMockTransporter();
+	return {
+		createTransport: jest.fn().mockReturnValue(t),
+		__transporter: t,
+	} as any;
+};
+
+const createService = (overrides?: { settingsService?: any; fs?: any; path?: any; compile?: any; mjml?: any; nodemailer?: any }) => {
+	const logger = createMockLogger();
+	const settingsService = overrides?.settingsService ?? createMockSettingsService();
+	const mockFs = overrides?.fs ?? createMockFs();
+	const mockPath = overrides?.path ?? createMockPath();
+	const compile = overrides?.compile ?? createMockCompile();
+	const mjml = overrides?.mjml ?? createMockMjml();
+	const mockNodemailer = overrides?.nodemailer ?? createMockNodemailer();
+
+	const service = new EmailService(settingsService, mockFs, mockPath, compile, mjml, mockNodemailer, logger as any);
+
+	return { service, logger, settingsService, mockFs, mockPath, compile, mjml, mockNodemailer };
+};
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+describe("EmailService", () => {
+	describe("SERVICE_NAME", () => {
+		it("returns EmailService from static property", () => {
+			expect(EmailService.SERVICE_NAME).toBe("EmailService");
+		});
+	});
+
+	// ── init / loadTemplate ──────────────────────────────────────────────
+
+	describe("init", () => {
+		it("loads all expected templates on construction", () => {
+			const { mockFs } = createService();
+
+			// 5 templates loaded
+			expect(mockFs.readFileSync).toHaveBeenCalledTimes(5);
+		});
+
+		it("compiles each loaded template", () => {
+			const { compile } = createService();
+
+			expect(compile).toHaveBeenCalledTimes(5);
+		});
+
+		it("logs error when a template file is not found", () => {
+			const failFs = {
+				readFileSync: jest.fn().mockImplementation(() => {
+					throw new Error("ENOENT: no such file");
+				}),
+			};
+
+			const { logger } = createService({ fs: failFs });
+
+			expect(logger.error).toHaveBeenCalledWith(
+				expect.objectContaining({ err: new Error("ENOENT: no such file"), templateName: expect.any(String) }),
+				"Failed to load email template"
+			);
+			expect(logger.child).toHaveBeenCalledWith({ service: "EmailService" });
+		});
+
+		it("logs non-Error thrown values under err in loadTemplate", () => {
+			const failFs = {
+				readFileSync: jest.fn().mockImplementation(() => {
+					throw "string error";
+				}),
+			};
+
+			const { logger } = createService({ fs: failFs });
+
+			expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({ err: "string error" }), "Failed to load email template");
+		});
+
+		it("can be called again to reinitialize templates", () => {
+			const { service, mockFs } = createService();
+			const initialCalls = mockFs.readFileSync.mock.calls.length;
+
+			service.init();
+
+			expect(mockFs.readFileSync).toHaveBeenCalledTimes(initialCalls + 5);
+		});
+	});
+
+	// ── buildEmail ───────────────────────────────────────────────────────
+
+	describe("buildEmail", () => {
+		it("compiles template with context and returns rendered HTML", async () => {
+			const { service } = createService();
+
+			const result = await service.buildEmail("welcomeEmailTemplate", { name: "Test" });
+
+			expect(result).toBe("<html>rendered</html>");
+		});
+
+		it("passes context to the compiled template function", async () => {
+			const compile = createMockCompile();
+			const { service } = createService({ compile });
+			const context = { name: "Alex", url: "https://example.com" };
+
+			await service.buildEmail("welcomeEmailTemplate", context);
+
+			expect(compile.__compiledFn).toHaveBeenCalledWith(context);
+		});
+
+		it("returns undefined and logs error when template is not found", async () => {
+			const { service, logger } = createService();
+
+			const result = await service.buildEmail("nonExistentTemplate", {});
+
+			expect(result).toBeUndefined();
+			expect(logger.error).toHaveBeenCalledWith({ err: new Error("Template nonExistentTemplate not found") }, "Failed to build email");
+		});
+
+		it("returns undefined and logs error when template function returns falsy", async () => {
+			const compile = jest.fn().mockReturnValue(jest.fn().mockReturnValue(undefined)) as any;
+			const { service, logger } = createService({ compile });
+
+			const result = await service.buildEmail("welcomeEmailTemplate", {});
+
+			expect(result).toBeUndefined();
+			expect(logger.error).toHaveBeenCalledWith({ err: new Error("Template welcomeEmailTemplate not found") }, "Failed to build email");
+		});
+
+		it("returns undefined and logs error when mjml throws", async () => {
+			const mjml = jest.fn().mockImplementation(() => {
+				throw new Error("MJML parse error");
+			}) as any;
+			const { service, logger } = createService({ mjml });
+
+			const result = await service.buildEmail("welcomeEmailTemplate", {});
+
+			expect(result).toBeUndefined();
+			expect(logger.error).toHaveBeenCalledWith({ err: new Error("MJML parse error") }, "Failed to build email");
+		});
+
+		it("logs non-Error thrown values under err in buildEmail", async () => {
+			const mjml = jest.fn().mockImplementation(() => {
+				throw null;
+			}) as any;
+			const { service, logger } = createService({ mjml });
+
+			const result = await service.buildEmail("welcomeEmailTemplate", {});
+
+			expect(result).toBeUndefined();
+			expect(logger.error).toHaveBeenCalledWith({ err: null }, "Failed to build email");
+		});
+	});
+
+	// ── sendEmail ────────────────────────────────────────────────────────
+
+	describe("sendEmail", () => {
+		it("sends email with provided transport config and returns messageId", async () => {
+			const transporter = createMockTransporter();
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ nodemailer });
+			const config = makeTransportConfig();
+
+			const result = await service.sendEmail("to@example.com", "Subject", "<p>body</p>", config);
+
+			expect(result).toBe("msg-123");
+			expect(transporter.verify).toHaveBeenCalled();
+			expect(transporter.sendMail).toHaveBeenCalledWith({
+				to: "to@example.com",
+				from: "noreply@example.com",
+				subject: "Subject",
+				html: "<p>body</p>",
+			});
+		});
+
+		it("falls back to DB settings when no transport config is provided", async () => {
+			const settingsService = createMockSettingsService();
+			const transporter = createMockTransporter();
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ settingsService, nodemailer });
+
+			await service.sendEmail("to@example.com", "Subject", "<p>body</p>");
+
+			expect(settingsService.getDBSettings).toHaveBeenCalled();
+		});
+
+		it("creates transporter with correct email config", async () => {
+			const transporter = createMockTransporter();
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ nodemailer });
+			const config = makeTransportConfig({
+				systemEmailHost: "smtp.test.com",
+				systemEmailPort: 465,
+				systemEmailSecure: true,
+				systemEmailPool: true,
+				systemEmailUser: "testuser",
+				systemEmailPassword: "testpass",
+				systemEmailConnectionHost: "conn.test.com",
+				systemEmailRejectUnauthorized: false,
+				systemEmailIgnoreTLS: true,
+				systemEmailRequireTLS: false,
+				systemEmailTLSServername: "tls.test.com",
+			});
+
+			await service.sendEmail("to@example.com", "Subject", "<p>body</p>", config);
+
+			expect(nodemailer.createTransport).toHaveBeenCalledWith({
+				host: "smtp.test.com",
+				port: 465,
+				secure: true,
+				auth: { user: "testuser", pass: "testpass" },
+				name: "conn.test.com",
+				connectionTimeout: 5000,
+				pool: true,
+				tls: {
+					rejectUnauthorized: false,
+					ignoreTLS: true,
+					requireTLS: false,
+					servername: "tls.test.com",
+				},
+			});
+		});
+
+		it("uses systemEmailAddress as auth user when systemEmailUser is falsy", async () => {
+			const transporter = createMockTransporter();
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ nodemailer });
+			const config = makeTransportConfig({ systemEmailUser: "", systemEmailAddress: "fallback@example.com" });
+
+			await service.sendEmail("to@example.com", "Subject", "<p>body</p>", config);
+
+			expect(nodemailer.createTransport).toHaveBeenCalledWith(
+				expect.objectContaining({
+					auth: expect.objectContaining({ user: "fallback@example.com" }),
+				})
+			);
+		});
+
+		it("uses 'localhost' as name when systemEmailConnectionHost is falsy", async () => {
+			const transporter = createMockTransporter();
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ nodemailer });
+			const config = makeTransportConfig({ systemEmailConnectionHost: "" });
+
+			await service.sendEmail("to@example.com", "Subject", "<p>body</p>", config);
+
+			expect(nodemailer.createTransport).toHaveBeenCalledWith(expect.objectContaining({ name: "localhost" }));
+		});
+
+		// Callers wrap sendEmail in .catch()/try-catch to react to delivery failures, so a
+		// transport error has to reject rather than resolve to a falsy value.
+		it("throws when transporter verification fails", async () => {
+			const transporter = createMockTransporter();
+			(transporter.verify as jest.Mock).mockRejectedValue(new Error("SMTP auth failed"));
+			const nodemailer = createMockNodemailer(transporter);
+			const { service, logger } = createService({ nodemailer });
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig())).rejects.toThrow(
+				"SMTP host smtp.example.com:587 failed verification."
+			);
+			expect(logger.warn).toHaveBeenCalledWith(
+				{ err: new Error("SMTP auth failed"), host: "smtp.example.com", port: 587 },
+				"Email transporter verification failed"
+			);
+		});
+
+		it.each([
+			["EAUTH", "SMTP host smtp.example.com:587 rejected the login. Check the user name and password."],
+			["ETIMEDOUT", "SMTP host smtp.example.com:587 did not respond. Check the port and the secure setting."],
+			["EDNS", "SMTP host smtp.example.com:587 could not be resolved. Check the host name."],
+			["ECONNECTION", "SMTP host smtp.example.com:587 refused the connection. Check the host and port."],
+			["ETLS", "SMTP host smtp.example.com:587 failed the TLS handshake. Check the secure and TLS settings."],
+		])("describes a %s verification failure without the server's reply text", async (code, expected) => {
+			const transporter = createMockTransporter();
+			(transporter.verify as jest.Mock).mockRejectedValue(Object.assign(new Error("535-5.7.8 Username and Password not accepted"), { code }));
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ nodemailer });
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig())).rejects.toMatchObject({
+				message: expected,
+				status: 502,
+				details: { cause: "535-5.7.8 Username and Password not accepted" },
+			});
+		});
+
+		it("throws a 400 without building a transport when the host is not configured", async () => {
+			const nodemailer = createMockNodemailer();
+			const { service } = createService({ nodemailer });
+
+			await expect(
+				service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig({ systemEmailHost: undefined }))
+			).rejects.toMatchObject({
+				status: 400,
+				message: "Email is not configured. Set the system email host in settings.",
+			});
+			expect(nodemailer.createTransport).not.toHaveBeenCalled();
+		});
+
+		it("treats an empty host as not configured", async () => {
+			const { service } = createService();
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig({ systemEmailHost: "" }))).rejects.toMatchObject(
+				{
+					status: 400,
+				}
+			);
+		});
+
+		it("reports the underlying cause when verification fails", async () => {
+			const transporter = createMockTransporter();
+			(transporter.verify as jest.Mock).mockRejectedValue(new Error("SMTP auth failed"));
+			const nodemailer = createMockNodemailer(transporter);
+			const { service } = createService({ nodemailer });
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig())).rejects.toMatchObject({
+				status: 502,
+				details: { cause: "SMTP auth failed" },
+			});
+		});
+
+		it("logs a non-Error verification failure under err", async () => {
+			const transporter = createMockTransporter();
+			(transporter.verify as jest.Mock).mockRejectedValue("connection refused");
+			const nodemailer = createMockNodemailer(transporter);
+			const { service, logger } = createService({ nodemailer });
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig())).rejects.toThrow();
+			expect(logger.warn).toHaveBeenCalledWith(
+				{ err: "connection refused", host: "smtp.example.com", port: 587 },
+				"Email transporter verification failed"
+			);
+		});
+
+		it("throws and logs error when sendMail throws", async () => {
+			const transporter = createMockTransporter();
+			(transporter.sendMail as jest.Mock).mockRejectedValue(new Error("Recipient rejected"));
+			const nodemailer = createMockNodemailer(transporter);
+			const { service, logger } = createService({ nodemailer });
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig())).rejects.toMatchObject({
+				message: "Failed to send email",
+				details: { cause: "Recipient rejected" },
+			});
+			expect(logger.error).toHaveBeenCalledWith({ err: new Error("Recipient rejected") }, "Failed to send email");
+		});
+
+		it("logs non-Error thrown values under err in sendMail", async () => {
+			const transporter = createMockTransporter();
+			(transporter.sendMail as jest.Mock).mockRejectedValue(42);
+			const nodemailer = createMockNodemailer(transporter);
+			const { service, logger } = createService({ nodemailer });
+
+			await expect(service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig())).rejects.toMatchObject({
+				details: { cause: "Unknown error" },
+			});
+			expect(logger.error).toHaveBeenCalledWith({ err: 42 }, "Failed to send email");
+		});
+
+		// ── from-header formatting ───────────────────────────────────────
+
+		describe("from header formatting", () => {
+			const sendAndGetFrom = async (overrides: Partial<EmailTransportConfig>) => {
+				const transporter = createMockTransporter();
+				const nodemailer = createMockNodemailer(transporter);
+				const { service } = createService({ nodemailer });
+
+				await service.sendEmail("to@example.com", "Subject", "<p>body</p>", makeTransportConfig(overrides));
+
+				const call = (transporter.sendMail as jest.Mock).mock.calls[0]?.[0] as { from: unknown } | undefined;
+				return call?.from;
+			};
+
+			it("uses bare address when systemEmailDisplayName is undefined", async () => {
+				const from = await sendAndGetFrom({
+					systemEmailAddress: "noreply@example.com",
+					systemEmailDisplayName: undefined,
+				});
+
+				expect(from).toBe("noreply@example.com");
+			});
+
+			it("uses bare address when systemEmailDisplayName is empty string", async () => {
+				const from = await sendAndGetFrom({
+					systemEmailAddress: "noreply@example.com",
+					systemEmailDisplayName: "",
+				});
+
+				expect(from).toBe("noreply@example.com");
+			});
+
+			it("uses bare address when systemEmailDisplayName is whitespace-only", async () => {
+				const from = await sendAndGetFrom({
+					systemEmailAddress: "noreply@example.com",
+					systemEmailDisplayName: "   ",
+				});
+
+				expect(from).toBe("noreply@example.com");
+			});
+
+			it("uses {name, address} when display name and address are both set", async () => {
+				const from = await sendAndGetFrom({
+					systemEmailAddress: "noreply@example.com",
+					systemEmailDisplayName: "Checkmate notifications",
+				});
+
+				expect(from).toEqual({
+					name: "Checkmate notifications",
+					address: "noreply@example.com",
+				});
+			});
+
+			it("trims surrounding whitespace from display name", async () => {
+				const from = await sendAndGetFrom({
+					systemEmailAddress: "noreply@example.com",
+					systemEmailDisplayName: "   Checkmate   ",
+				});
+
+				expect(from).toEqual({
+					name: "Checkmate",
+					address: "noreply@example.com",
+				});
+			});
+
+			it("falls back to bare address when display name is set but address is empty", async () => {
+				const from = await sendAndGetFrom({
+					systemEmailAddress: "",
+					systemEmailDisplayName: "Checkmate",
+				});
+
+				expect(from).toBe("");
+			});
+		});
+	});
+});

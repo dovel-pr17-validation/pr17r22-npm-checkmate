@@ -1,0 +1,117 @@
+import {
+	Table,
+	Pagination,
+	CheckStatusLabel,
+	StatusCodeLabel,
+} from "@/Components/design-elements";
+import Box from "@mui/material/Box";
+import type { Header } from "@/Components/design-elements/Table";
+import type { Monitor } from "@/Types/Monitor";
+import { useTranslation } from "react-i18next";
+import type { Check } from "@/Types/Check";
+import { useFormatDate } from "@/Hooks/useFormatDate";
+
+export const ChecksTable = ({
+	monitors,
+	checks,
+	checksCount,
+	page,
+	setPage,
+	rowsPerPage,
+	setRowsPerPage,
+}: {
+	monitors: Monitor[] | null;
+	checks: Check[];
+	checksCount: number;
+	page: number;
+	setPage: (page: number) => void;
+	rowsPerPage: number;
+	setRowsPerPage: (rowsPerPage: number) => void;
+}) => {
+	const { t } = useTranslation();
+	const formatDate = useFormatDate();
+
+	const getHeaders = () => {
+		const headers: Header<Check>[] = [
+			{
+				id: "monitorName",
+				content: t("common.table.headers.monitor"),
+				render: (row) => {
+					return (
+						monitors?.find((monitor) => monitor.id === row.metadata.monitorId)?.name ||
+						"N/A"
+					);
+				},
+			},
+			{
+				id: "status",
+				content: t("common.table.headers.status"),
+				render: (row) => {
+					return <CheckStatusLabel check={row} />;
+				},
+			},
+			{
+				id: "date",
+				content: t("common.table.headers.dateTime"),
+				render: (row) => {
+					return formatDate(row.createdAt, "dateTime");
+				},
+			},
+			{
+				id: "statusCode",
+				content: t("pages.checks.table.headers.statusCode"),
+				render: (row) => {
+					return (
+						<StatusCodeLabel
+							statusCode={row.statusCode}
+							message={row.message}
+						/>
+					);
+				},
+			},
+			{
+				id: "message",
+				content: t("common.table.headers.message"),
+				render: (row) => {
+					return row.message || "N/A";
+				},
+			},
+		];
+		return headers;
+	};
+
+	const headers = getHeaders();
+
+	const handlePageChange = (
+		_e: React.MouseEvent<HTMLButtonElement> | null,
+		newPage: number
+	) => {
+		setPage(newPage);
+	};
+
+	const handleRowsPerPageChange = (
+		e: React.ChangeEvent<HTMLTextAreaElement | HTMLInputElement>
+	) => {
+		const value = Number(e.target.value);
+		setPage(0);
+		setRowsPerPage(value);
+	};
+
+	return (
+		<Box>
+			<Table
+				headers={headers}
+				data={checks}
+				emptyViewText={t("pages.checks.table.empty")}
+			/>
+			<Pagination
+				component="div"
+				count={checksCount}
+				page={page}
+				rowsPerPage={rowsPerPage}
+				onPageChange={handlePageChange}
+				onRowsPerPageChange={handleRowsPerPageChange}
+			/>
+		</Box>
+	);
+};

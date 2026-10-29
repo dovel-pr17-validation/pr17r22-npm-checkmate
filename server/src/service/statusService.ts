@@ -1,0 +1,253 @@
+import { IMonitorStatsRepository } from "@/domain/monitor-stats/monitor-stats.repository.interface.js";
+import { IMonitorsRepository } from "@/domain/monitors/monitor.repository.interface.js";
+import type { Check, CheckDiskInfo } from "@/domain/checks/check.type.js";
+import {
+	HardwareMetricKeys,
+	MonitorStatuses,
+	type HardwareBreaches,
+	type HardwareCounters,
+	type Monitor,
+	type MonitorStatus,
+} from "@/domain/monitors/monitor.type.js";
+import type { StatusChangeResult } from "@/types/network.js";
+import { AppError, internalError } from "@/utils/AppError.js";
+import { ILogger } from "@/utils/logger/logger.js";
+import type { HardwareStatusMetrics } from "@/types/network.js";
+import { MAX_RECENT_CHECKS } from "@/domain/monitors/monitor.type.js";
+import { toCheckSnapshot } from "@/domain/checks/check.snapshot.js";
+import { findContainerBreaches } from "@/domain/docker/docker-alert.js";
+
+const SERVICE_NAME = "StatusService";
+const HARDWARE_ALERT_COUNTER_START = 5;
+
+export interface IStatusService {
+	updateMonitorStatus(check: Check, monitor: Monitor): Promise<StatusChangeResult>;
+}
+
+export class StatusService implements IStatusService {
+	static SERVICE_NAME = SERVICE_NAME;
+	private logger: ILogger;
+	private monitorsRepository: IMonitorsRepository;
+	private monitorStatsRepository: IMonitorStatsRepository;
+
+	constructor(logger: ILogger, monitorsRepository: IMonitorsRepository, monitorStatsRepository: IMonitorStatsRepository) {
+		this.logger = logger.child({ service: SERVICE_NAME });
+		this.monitorsRepository = monitorsRepository;
+		this.monitorStatsRepository = monitorStatsRepository;
+	}
+
+	private tryUpdateRunningStats = async (check: Check, monitor: Monitor) => {
+		try {
+			await this.monitorStatsRepository.updateByMonitorId(monitor.id, {
+				status: check.status === true,
+				responseTime: check.responseTime ?? 0,
+				now: Date.now(),
+			});
+		} catch (error: unknown) {
+			this.logger.warn({ err: error }, "Failed to update running stats");
+		}
+	};
+
+	private computeReachability = (
+		currentStatus: MonitorStatus,
+		window: Array<boolean>,
+		threshold: number
+	): { nextStatus: "up" | "down"; transitioned: boolean } => {
+		const failures = window.filter((status) => status === false).length;
+		const failureRate = (failures / window.length) * 100;
+
+		if (failureRate >= threshold && currentStatus !== "down") {
+			return { nextStatus: "down", transitioned: true };
+		}
+
+		if (failureRate < threshold && currentStatus === "down") {
+			return { nextStatus: "up", transitioned: true };
+		}
+		return { nextStatus: "up", transitioned: false };
+	};
+
+	private computeHardwareStatus = (params: {
+		currentStatus: MonitorStatus;
+		reachabilityDown: boolean;
+		metrics: HardwareStatusMetrics;
+		thresholds: { cpu: number; memory: number; disk: number; temp: number };
+		counters: HardwareCounters;
+	}): {
+		nextStatus: MonitorStatus;
+		transitioned: boolean;
+		breaches: HardwareBreaches;
+		nextCounters: HardwareCounters;
+	} => {
+		const { metrics, thresholds, counters, currentStatus, reachabilityDown } = params;
+
+		const cpuUsage = metrics.cpu?.usage_percent ?? -1;
+		const memoryUsage = metrics.memory?.usage_percent ?? -1;
+		const temps = metrics.cpu?.temperature ?? [];
+
+		const breaches: HardwareBreaches = {
+			cpu: cpuUsage !== -1 && cpuUsage > thresholds.cpu / 100,
+			memory: memoryUsage !== -1 && memoryUsage > thresholds.memory / 100,
+			disk: metrics.disk
+				? metrics.disk.some((d: CheckDiskInfo) => d != null && typeof d.usage_percent === "number" && d.usage_percent > thresholds.disk / 100)
+				: false,
+			temp: temps.some((temp: number) => temp > thresholds.temp),
+		};
+
+		// Update counters: decrement (floored at 0) if breached, reset to start otherwise.
+		const nextCounters = { ...counters };
+		for (const key of HardwareMetricKeys) {
+			nextCounters[key] = breaches[key] ? Math.max(0, counters[key] - 1) : HARDWARE_ALERT_COUNTER_START;
+		}
+
+		// Status transition: reachability "down" takes precedence; hardware can only drive
+		// transitions into "breached" and back out to "up". Any other case leaves status untouched.
+		let nextStatus: MonitorStatus = currentStatus;
+		let transitioned = false;
+
+		if (!reachabilityDown) {
+			// A counter can only reach zero via the decrement path, which only runs when that
+			// metric is currently breaching — so anyCounterZero already implies anyBreached.
+			const anyCounterZero = HardwareMetricKeys.some((k) => nextCounters[k] === 0);
+			const allNormal = HardwareMetricKeys.every((k) => !breaches[k]);
+
+			if (anyCounterZero && currentStatus !== "breached") {
+				nextStatus = "breached";
+				transitioned = true;
+			} else if (allNormal && currentStatus === "breached") {
+				nextStatus = "up";
+				transitioned = true;
+			}
+		}
+
+		return { nextStatus, transitioned, breaches, nextCounters };
+	};
+
+	private computeDockerStatus = (params: { currentStatus: MonitorStatus; reachabilityDown: boolean; breaching: boolean }) => {
+		const { currentStatus, reachabilityDown, breaching } = params;
+		let nextStatus: MonitorStatus = currentStatus;
+		let transitioned = false;
+
+		if (!reachabilityDown) {
+			if (breaching && currentStatus !== "breached") {
+				nextStatus = "breached";
+				transitioned = true;
+			} else if (!breaching && currentStatus === "breached") {
+				nextStatus = "up";
+				transitioned = true;
+			}
+		}
+		return { nextStatus, transitioned };
+	};
+
+	updateMonitorStatus = async (check: Check, monitor: Monitor): Promise<StatusChangeResult> => {
+		try {
+			const { status } = check;
+
+			// Update running stats
+			await this.tryUpdateRunningStats(check, monitor);
+
+			const prevStatus = monitor.status;
+			const checkSnapshot = toCheckSnapshot(check);
+
+			// Project the window as it will look after updating DB
+			// This is done because we need the updated status window to compute new status, but we don't
+			// want an an extra DB write just to get the window.
+			const projectedWindow = [...(monitor.statusWindow || []), check.status].slice(-monitor.statusWindowSize);
+
+			// Build the status patch — computed against the projected window
+			const patch: Partial<Monitor> = {};
+
+			// Resolve "initializing" and "maintenance" up front, incidents should be created on initialization && down
+			// Unknown values (e.g. legacy boolean statuses from old versions) are resolved the same way,
+			// otherwise computeReachability can never transition them and they stay stuck forever.
+			const isUnknownStatus = !MonitorStatuses.includes(monitor.status);
+			let newStatus: MonitorStatus = monitor.status;
+			let statusChanged = false;
+			if (monitor.status === "initializing" || monitor.status === "maintenance" || isUnknownStatus) {
+				newStatus = status ? "up" : "down";
+				patch.status = newStatus;
+				statusChanged = newStatus === "down";
+			}
+
+			let thresholdBreaches: HardwareBreaches | undefined;
+
+			if (projectedWindow.length >= monitor.statusWindowSize) {
+				// First evaluate reachability status changes, which apply to all monitor types
+				// and take precedence over hardware breaches.
+				const reachabilityResult = this.computeReachability(newStatus, projectedWindow, monitor.statusWindowThreshold);
+				if (reachabilityResult.transitioned) {
+					newStatus = reachabilityResult.nextStatus;
+					statusChanged = true;
+				}
+
+				// Evaluate hardware threshold breaches
+				if (monitor.type === "hardware") {
+					const hardware = this.computeHardwareStatus({
+						currentStatus: newStatus,
+						reachabilityDown: newStatus === "down",
+						metrics: check,
+						thresholds: {
+							cpu: monitor.cpuAlertThreshold,
+							memory: monitor.memoryAlertThreshold,
+							disk: monitor.diskAlertThreshold,
+							temp: monitor.tempAlertThreshold,
+						},
+						counters: {
+							cpu: monitor.cpuAlertCounter,
+							memory: monitor.memoryAlertCounter,
+							disk: monitor.diskAlertCounter,
+							temp: monitor.tempAlertCounter,
+						},
+					});
+
+					patch.cpuAlertCounter = hardware.nextCounters.cpu;
+					patch.memoryAlertCounter = hardware.nextCounters.memory;
+					patch.diskAlertCounter = hardware.nextCounters.disk;
+					patch.tempAlertCounter = hardware.nextCounters.temp;
+					thresholdBreaches = hardware.breaches;
+					if (hardware.transitioned) {
+						newStatus = hardware.nextStatus;
+						statusChanged = true;
+					}
+				}
+
+				if (monitor.type === "docker" && check.containers) {
+					const breaches = findContainerBreaches(monitor, check.containers);
+					const docker = this.computeDockerStatus({
+						currentStatus: newStatus,
+						reachabilityDown: newStatus === "down",
+						breaching: breaches.length > 0,
+					});
+					if (docker.transitioned) {
+						newStatus = docker.nextStatus;
+						statusChanged = true;
+					}
+				}
+				patch.status = newStatus;
+			}
+
+			// Single atomic write: push arrays + set status/counters
+			const updated = await this.monitorsRepository.updateStatusWindowAndChecks(
+				monitor.id,
+				monitor.teamId,
+				check.status,
+				checkSnapshot,
+				monitor.statusWindowSize,
+				MAX_RECENT_CHECKS,
+				patch
+			);
+
+			return {
+				monitor: updated,
+				statusChanged,
+				prevStatus,
+				thresholdBreaches,
+			};
+		} catch (error: unknown) {
+			throw new AppError(internalError, {
+				message: `Failed to update monitor with id ${check.metadata.monitorId} with status: ${error instanceof Error ? error.message : "Unknown error"}`,
+				service: SERVICE_NAME,
+			});
+		}
+	};
+}

@@ -1,0 +1,106 @@
+import type { Invite } from "@/domain/invites/invite.type.js";
+import type { UserRole } from "@/domain/users/user.type.js";
+import { canManageRole } from "@/domain/users/user.type.js";
+import type { IInvitesRepository } from "@/domain/invites/invite.repository.interface.js";
+import { AppError, internalError } from "@/utils/AppError.js";
+import { ISettingsService } from "../app-settings/app-settings.service.js";
+import { IEmailService } from "@/service/emailService.js";
+import { inviteErrors } from "@/domain/invites/invite.errors.js";
+
+const SERVICE_NAME = "inviteService";
+
+export interface IInviteService {
+	getInviteToken(params: { invite: Partial<Invite>; teamId: string; userRoles: UserRole[] }): Promise<Invite>;
+	sendInviteEmail(params: { invite: Partial<Invite>; firstName: string; userRoles: UserRole[] }): Promise<void>;
+	verifyInviteToken(params: { inviteToken: string }): Promise<Invite>;
+}
+
+export class InviteService implements IInviteService {
+	static SERVICE_NAME = SERVICE_NAME;
+
+	private settingsService: ISettingsService;
+	private emailService: IEmailService;
+	private invitesRepository: IInvitesRepository;
+
+	constructor({
+		invitesRepository,
+		settingsService,
+		emailService,
+	}: {
+		invitesRepository: IInvitesRepository;
+		settingsService: ISettingsService;
+		emailService: IEmailService;
+	}) {
+		this.invitesRepository = invitesRepository;
+		this.settingsService = settingsService;
+		this.emailService = emailService;
+	}
+
+	getInviteToken = async ({ invite, teamId, userRoles }: { invite: Partial<Invite>; teamId: string; userRoles: UserRole[] }) => {
+		invite.teamId = teamId;
+
+		const inviteRoles = invite.role ?? [];
+
+		for (const targetRole of inviteRoles) {
+			const canManage = userRoles.some((actorRole) => canManageRole(actorRole, targetRole));
+			if (!canManage) {
+				throw new AppError(inviteErrors.roleAboveCaller, {
+					message: "You do not have permission to create this invite",
+					service: SERVICE_NAME,
+				});
+			}
+		}
+
+		const inviteToken = await this.invitesRepository.create(invite);
+		return inviteToken;
+	};
+
+	sendInviteEmail = async ({ invite, firstName, userRoles }: { invite: Partial<Invite>; firstName: string; userRoles: UserRole[] }) => {
+		const inviteRoles = invite.role ?? [];
+		if (!invite.email) {
+			throw new AppError(inviteErrors.emailRequired, {
+				message: "Invite email is required to send an invite",
+				service: SERVICE_NAME,
+			});
+		}
+
+		for (const targetRole of inviteRoles) {
+			const canManage = userRoles.some((actorRole) => canManageRole(actorRole, targetRole));
+			if (!canManage) {
+				throw new AppError(inviteErrors.roleAboveCaller, {
+					message: "You do not have permission to create this invite",
+					service: SERVICE_NAME,
+				});
+			}
+		}
+
+		const inviteToken = await this.invitesRepository.create(invite);
+		const { clientHost } = this.settingsService.getSettings();
+
+		const html = await this.emailService.buildEmail("employeeActivationTemplate", {
+			name: firstName,
+			link: `${clientHost}/register/${inviteToken.token}`,
+		});
+
+		if (!html) {
+			throw new AppError(internalError, {
+				message: "Failed to build invite e-mail... Please verify your settings.",
+				service: SERVICE_NAME,
+			});
+		}
+
+		try {
+			await this.emailService.sendEmail(invite.email, "Welcome to Uptime Monitor", html);
+		} catch (error: unknown) {
+			throw new AppError(internalError, {
+				message: "Failed to send invite e-mail... Please verify your settings.",
+				service: SERVICE_NAME,
+				details: { cause: error instanceof Error ? error.message : "Unknown error" },
+			});
+		}
+	};
+
+	verifyInviteToken = async ({ inviteToken }: { inviteToken: string }) => {
+		return await this.invitesRepository.findByToken(inviteToken);
+	};
+}

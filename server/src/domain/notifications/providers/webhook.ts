@@ -1,0 +1,105 @@
+const SERVICE_NAME = "WebhookProvider";
+import type { Notification } from "@/domain/notifications/notification.type.js";
+import { NotificationProvider } from "@/domain/notifications/providers/INotificationProvider.js";
+import type { NotificationMessage } from "@/domain/notifications/notification.type.js";
+import { getTestMessage, incidentUrl } from "@/domain/notifications/providers/utils.js";
+import got from "got";
+
+export class WebhookProvider extends NotificationProvider {
+	protected readonly serviceName = SERVICE_NAME;
+
+	sendMessage = async (notification: Notification, message: NotificationMessage): Promise<boolean> => {
+		if (!notification.address) {
+			return false;
+		}
+
+		// Build webhook payload from unified message
+		const payload = this.buildWebhookPayload(message);
+
+		try {
+			await got.post(notification.address, {
+				json: payload,
+				headers: {
+					"Content-Type": "application/json",
+				},
+				...this.gotRequestOptions(),
+			});
+			this.logger.info("Webhook notification sent");
+			return true;
+		} catch (error) {
+			this.logger.warn({ err: error }, "Webhook alert failed");
+			return false;
+		}
+	};
+
+	private buildWebhookPayload(message: NotificationMessage): object {
+		const lines: string[] = [];
+
+		// Title and summary
+		lines.push(`**${message.content.title}**`);
+		lines.push(message.content.summary);
+		lines.push("");
+
+		// Monitor information
+		lines.push("**Monitor Details:**");
+		lines.push(`- Name: ${message.monitor.name}`);
+		lines.push(`- URL: ${message.monitor.url}`);
+		lines.push(`- Type: ${message.monitor.type}`);
+		lines.push(`- Status: ${message.monitor.status}`);
+		lines.push("");
+
+		// Additional details
+		if (message.content.details && message.content.details.length > 0) {
+			lines.push("**Additional Information:**");
+			message.content.details.forEach((detail) => lines.push(`- ${detail}`));
+			lines.push("");
+		}
+
+		// Threshold breaches (for hardware monitors)
+		if (message.content.thresholds && message.content.thresholds.length > 0) {
+			lines.push("**Threshold Breaches:**");
+			message.content.thresholds.forEach((breach) => {
+				lines.push(`- ${breach.metric.toUpperCase()}: ${breach.formattedValue} (threshold: ${breach.threshold}${breach.unit})`);
+			});
+			lines.push("");
+		}
+
+		// Incident link
+		if (message.content.incident) {
+			lines.push(`[View Incident](${incidentUrl(message)})`);
+		}
+
+		// Return webhook payload with both text and structured data
+		return {
+			text: lines.join("\n"),
+			severity: message.severity,
+			type: message.type,
+			monitor: {
+				id: message.monitor.id,
+				name: message.monitor.name,
+				url: message.monitor.url,
+				status: message.monitor.status,
+			},
+			timestamp: message.content.timestamp,
+		};
+	}
+
+	sendTestAlert = async (notification: Partial<Notification>) => {
+		if (!notification.address) {
+			return false;
+		}
+		try {
+			await got.post(notification.address, {
+				json: { text: getTestMessage() },
+				headers: {
+					"Content-Type": "application/json",
+				},
+				...this.gotRequestOptions(),
+			});
+			return true;
+		} catch (error) {
+			this.logger.warn({ err: error }, "Webhook test alert failed");
+			return false;
+		}
+	};
+}

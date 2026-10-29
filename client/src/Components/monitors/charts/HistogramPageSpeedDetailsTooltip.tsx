@@ -1,0 +1,77 @@
+import Box from "@mui/material/Box";
+import Stack from "@mui/material/Stack";
+import Typography from "@mui/material/Typography";
+import { useTheme } from "@mui/material/styles";
+import { SPACING, LAYOUT } from "@/Utils/Theme/constants";
+import type { ConfigItem } from "@/Components/monitors";
+import type { TooltipProps } from "recharts";
+import { useFormatDate } from "@/Hooks/useFormatDate";
+interface HistogramPageSpeedScoresTooltipProps extends Partial<
+	TooltipProps<number, string>
+> {
+	config: Record<string, ConfigItem>;
+}
+export const HistogramPageSpeedScoresTooltip = ({
+	active,
+	payload,
+	label,
+	config,
+}: HistogramPageSpeedScoresTooltipProps) => {
+	const theme = useTheme();
+	const formatDate = useFormatDate();
+
+	if (active && payload && payload.length) {
+		return (
+			<Box
+				sx={{
+					backgroundColor: theme.palette.background.paper,
+					border: 1,
+					borderColor: theme.palette.divider,
+					borderRadius: theme.shape.borderRadius,
+					py: theme.spacing(SPACING.LG),
+					px: theme.spacing(LAYOUT.XS),
+				}}
+			>
+				<Typography
+					sx={{
+						color: theme.palette.text.secondary,
+						fontSize: 12,
+						fontWeight: 500,
+					}}
+				>
+					{formatDate(label, "dateTime")}
+				</Typography>
+				{Object.keys(config)
+					.reverse()
+					.map((key) => {
+						const { palette } = config[key];
+						const dotColor = theme.palette[palette].main;
+
+						return (
+							<Stack
+								key={`${key}-tooltip`}
+								direction="row"
+								alignItems="center"
+								gap={theme.spacing(SPACING.XXL)}
+								mt={theme.spacing(SPACING.SM)}
+							>
+								<Box
+									width={theme.spacing(LAYOUT.XS)}
+									height={theme.spacing(LAYOUT.XS)}
+									sx={{ borderRadius: "50%", backgroundColor: dotColor }}
+								/>
+								<Typography
+									textTransform="capitalize"
+									sx={{ opacity: 0.8 }}
+								>
+									{config[key].text}
+								</Typography>
+								<Typography>{Math.floor(payload[0].payload[key])}</Typography>
+							</Stack>
+						);
+					})}
+			</Box>
+		);
+	}
+	return null;
+};

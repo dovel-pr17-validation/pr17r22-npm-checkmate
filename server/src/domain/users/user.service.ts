@@ -1,0 +1,357 @@
+import { ISettingsRepository } from "@/domain/app-settings/app-settings-repository.interface.js";
+import { IInvitesRepository } from "@/domain/invites/invite.repository.interface.js";
+import { IRecoveryTokensRepository } from "@/domain/recovery-tokens/recovery-token.repository.interface.js";
+import { ITeamsRepository } from "@/domain/teams/team.repository.interface.js";
+import { IUsersRepository } from "@/domain/users/user.repository.interface.js";
+import { IMonitorsRepository } from "@/domain/monitors/monitor.repository.interface.js";
+import type { User, UserResponse } from "@/domain/users/user.type.js";
+import { canManageRole, toUserResponse, type UserRole } from "@/domain/users/user.type.js";
+import bcrypt from "bcryptjs";
+import { AppError, internalError } from "@/utils/AppError.js";
+import { userErrors } from "@/domain/users/user.errors.js";
+import { IEmailService } from "@/service/emailService.js";
+import { EnvConfig, ISettingsService } from "@/domain/app-settings/app-settings.service.js";
+import { ILogger } from "@/utils/logger/logger.js";
+import { IJobScheduler } from "@/worker/worker.interface.js";
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
+type CryptoType = typeof crypto;
+type JwtType = typeof jwt;
+const SERVICE_NAME = "userService";
+
+export interface IUserService {
+	issueToken(payload: Partial<User>, appSettings: EnvConfig): string;
+	registerUser(user: Partial<User>, inviteToken: string, file: Express.Multer.File | null): Promise<{ user: UserResponse; token: string }>;
+	createUser(userData: Partial<User>, teamId: string, actorRoles: UserRole[], file: Express.Multer.File | null): Promise<UserResponse>;
+	loginUser(email: string, password: string): Promise<{ user: UserResponse; token: string }>;
+	editUser(
+		updates: Partial<User & { newPassword?: string; deleteProfileImage?: boolean }>,
+		file: Express.Multer.File | null,
+		currentUserId: string,
+		currentUserEmail: string
+	): Promise<UserResponse>;
+	checkSuperadminExists(): Promise<boolean>;
+	requestRecovery(email: string): Promise<string>;
+	validateRecovery(recoveryToken: string): Promise<void>;
+	resetPassword(password: string, recoveryToken: string): Promise<{ user: UserResponse; token: string }>;
+	deleteUser(params: { userId: string; teamId: string; roles: UserRole[] }): Promise<void>;
+	deleteUserById(params: { actorId: string; actorTeamId: string; actorRoles: UserRole[]; targetUserId: string }): Promise<void>;
+	getAllUsers(): Promise<UserResponse[]>;
+	getUserById(roles: UserRole[], userId: string): Promise<UserResponse>;
+	editUserById(userId: string, patch: Partial<User>): Promise<void>;
+	setPasswordByUserId(userId: string, password: string): Promise<UserResponse>;
+}
+
+export class UserService implements IUserService {
+	static SERVICE_NAME = SERVICE_NAME;
+
+	private hashPassword = (password: string): string => {
+		const salt = bcrypt.genSaltSync(10);
+		return bcrypt.hashSync(password, salt);
+	};
+
+	private emailService: IEmailService;
+	private settingsService: ISettingsService;
+	private logger: ILogger;
+	private jwt: JwtType;
+	private scheduler: IJobScheduler;
+	private crypto: CryptoType;
+	private monitorsRepository: IMonitorsRepository;
+	private usersRepository: IUsersRepository;
+	private invitesRepository: IInvitesRepository;
+	private recoveryTokensRepository: IRecoveryTokensRepository;
+	private settingsRepository: ISettingsRepository;
+	private teamsRepository: ITeamsRepository;
+
+	constructor({
+		crypto,
+		emailService,
+		settingsService,
+		logger,
+		jwt,
+		scheduler,
+		monitorsRepository,
+		usersRepository,
+		invitesRepository,
+		recoveryTokensRepository,
+		settingsRepository,
+		teamsRepository,
+	}: {
+		crypto: CryptoType;
+		emailService: IEmailService;
+		settingsService: ISettingsService;
+		logger: ILogger;
+		jwt: JwtType;
+		scheduler: IJobScheduler;
+		monitorsRepository: IMonitorsRepository;
+		usersRepository: IUsersRepository;
+		invitesRepository: IInvitesRepository;
+		recoveryTokensRepository: IRecoveryTokensRepository;
+		settingsRepository: ISettingsRepository;
+		teamsRepository: ITeamsRepository;
+	}) {
+		this.emailService = emailService;
+		this.settingsService = settingsService;
+		this.logger = logger.child({ service: SERVICE_NAME });
+		this.jwt = jwt;
+		this.scheduler = scheduler;
+		this.crypto = crypto;
+		this.monitorsRepository = monitorsRepository;
+		this.usersRepository = usersRepository;
+		this.invitesRepository = invitesRepository;
+		this.recoveryTokensRepository = recoveryTokensRepository;
+		this.settingsRepository = settingsRepository;
+		this.teamsRepository = teamsRepository;
+	}
+
+	issueToken = (payload: Partial<User>, appSettings: EnvConfig) => {
+		return this.jwt.sign(payload, appSettings.jwtSecret, { expiresIn: appSettings.jwtTTL });
+	};
+
+	registerUser = async (user: Partial<User>, inviteToken: string, file: Express.Multer.File | null) => {
+		// Create a new user
+		// If superAdmin exists, a token should be attached to all further register requests
+		const superAdminExists = await this.usersRepository.findSuperAdmin();
+		if (superAdminExists) {
+			const invite = await this.invitesRepository.findByTokenAndDelete(inviteToken);
+			user.role = invite.role ?? ["user"];
+			user.teamId = invite.teamId;
+			user.email = invite.email;
+		} else {
+			// This is the first account, create JWT secret to use if one is not supplied by env
+			const jwtSecret = this.crypto.randomBytes(64).toString("hex");
+			await this.settingsRepository.update({ jwtSecret });
+			// Create a new team
+			if (!user.email) {
+				throw new AppError(userErrors.firstUserEmailRequired, { service: SERVICE_NAME });
+			}
+			const team = await this.teamsRepository.create(user.email);
+			user.teamId = team.id;
+			user.role = ["superadmin"];
+		}
+
+		// Hash password before storing
+		if (user.password) {
+			user.password = this.hashPassword(user.password);
+		}
+
+		const newUser = await this.usersRepository.create(user as User, file);
+
+		this.logger.debug({ userId: newUser.id }, "New user created");
+
+		delete newUser.avatarImage;
+
+		const appSettings = await this.settingsService.getSettings();
+
+		const token = this.issueToken(newUser, appSettings);
+
+		try {
+			const html = await this.emailService.buildEmail("welcomeEmailTemplate", {
+				name: newUser.firstName,
+			});
+			if (!html) {
+				throw new Error("Failed to build welcome email HTML");
+			}
+			this.emailService.sendEmail(newUser.email, "Welcome to Uptime Monitor", html).catch((error: unknown) => {
+				this.logger.warn({ err: error }, "Failed to send welcome email");
+			});
+		} catch (error: unknown) {
+			this.logger.warn({ err: error }, "Failed to send welcome email");
+		}
+
+		return { user: newUser, token };
+	};
+
+	createUser = async (userData: Partial<User>, teamId: string, actorRoles: UserRole[], file: Express.Multer.File | null) => {
+		// Validate that the creator can assign the requested roles
+		const targetRoles = userData.role ?? [];
+		for (const targetRole of targetRoles) {
+			const canManage = actorRoles.some((actorRole) => canManageRole(actorRole, targetRole));
+			if (!canManage) {
+				throw new AppError(userErrors.roleAboveCaller, { service: SERVICE_NAME });
+			}
+		}
+
+		userData.teamId = teamId;
+
+		if (userData.password) {
+			userData.password = this.hashPassword(userData.password);
+		}
+
+		const newUser = await this.usersRepository.create(userData as User, file);
+
+		this.logger.debug({ userId: newUser.id }, "New user created by superadmin");
+
+		newUser.avatarImage = undefined;
+
+		return newUser;
+	};
+
+	loginUser = async (email: string, password: string) => {
+		// Check if user exists
+		const user = await this.usersRepository.findByEmail(email);
+		// Compare password
+		const match = await bcrypt.compare(password, user.password);
+
+		if (match !== true) {
+			throw new AppError(userErrors.invalidCredentials, { service: SERVICE_NAME });
+		}
+
+		const userResponse = toUserResponse(user);
+
+		// Happy path, return token
+		const appSettings = await this.settingsService.getSettings();
+		const token = this.issueToken({ ...userResponse, avatarImage: "" }, appSettings);
+		return { user: userResponse, token };
+	};
+
+	editUser = async (
+		updates: Partial<User & { newPassword?: string; deleteProfileImage?: boolean }>,
+		file: Express.Multer.File | null,
+		currentUserId: string,
+		currentUserEmail: string
+	) => {
+		// Change Password check
+		if (updates.password && updates.newPassword) {
+			updates.email = currentUserEmail;
+			const user = await this.usersRepository.findByEmail(currentUserEmail);
+			const match = await bcrypt.compare(updates.password, user.password);
+			// If not a match, throw a 403
+			// 403 instead of 401 to avoid triggering axios interceptor
+			if (!match) {
+				throw new AppError(userErrors.incorrectCurrentPassword, { service: SERVICE_NAME });
+			}
+			// If a match, update the password
+			updates.password = this.hashPassword(updates.newPassword);
+			delete updates.newPassword;
+		}
+
+		return await this.usersRepository.updateById(currentUserId, updates, file);
+	};
+
+	checkSuperadminExists = async () => {
+		return await this.usersRepository.findSuperAdmin();
+	};
+
+	requestRecovery = async (email: string) => {
+		const user = await this.usersRepository.findByEmail(email);
+
+		// Delete existing tokens
+		await this.recoveryTokensRepository.deleteManyByEmail(email);
+		const recoveryToken = await this.recoveryTokensRepository.create(email);
+		const name = user.firstName;
+		const settings = this.settingsService.getSettings();
+		const url = `${settings.clientHost}/set-new-password/${recoveryToken.token}`;
+
+		const html = await this.emailService.buildEmail("passwordResetTemplate", {
+			name,
+			email,
+			url,
+		});
+		if (!html) {
+			throw new AppError(internalError, {
+				message: "Failed to build password reset email HTML",
+				service: SERVICE_NAME,
+			});
+		}
+		const msgId = await this.emailService.sendEmail(email, "Checkmate Password Reset", html);
+		return msgId;
+	};
+
+	validateRecovery = async (recoveryToken: string) => {
+		// Throws if token not found, validating
+		await this.recoveryTokensRepository.findByToken(recoveryToken);
+	};
+
+	resetPassword = async (password: string, recoveryToken: string) => {
+		const existingToken = await this.recoveryTokensRepository.findByToken(recoveryToken);
+		const existingUser = await this.usersRepository.findByEmail(existingToken.email);
+
+		const match = await bcrypt.compare(password, existingUser.password);
+		if (match === true) {
+			throw new AppError(userErrors.passwordUnchanged, { service: SERVICE_NAME });
+		}
+
+		const hashedPassword = this.hashPassword(password);
+		await this.usersRepository.updateById(existingUser.id, { password: hashedPassword }, null);
+		await this.recoveryTokensRepository.deleteManyByEmail(existingUser.email);
+
+		const userResponse = toUserResponse(existingUser);
+		const token = this.issueToken(userResponse, await this.settingsService.getSettings());
+
+		return { user: userResponse, token };
+	};
+
+	deleteUser = async ({ userId, teamId, roles }: { userId: string; teamId: string; roles: UserRole[] }) => {
+		if (roles.includes("demo")) {
+			throw new AppError(userErrors.demoUserProtected, { service: SERVICE_NAME });
+		}
+
+		if (roles.includes("superadmin")) {
+			const monitors = await this.monitorsRepository.findByTeamId(teamId, {}, { includeRecentChecks: false });
+			if (monitors) {
+				await Promise.all(monitors.map((monitor) => this.scheduler.deleteJob(monitor)));
+			}
+		}
+		// 6. Delete the user by id
+		await this.usersRepository.deleteById(userId);
+	};
+
+	deleteUserById = async ({
+		actorId,
+		actorRoles,
+		actorTeamId,
+		targetUserId,
+	}: {
+		actorId: string;
+		actorTeamId: string;
+		actorRoles: UserRole[];
+		targetUserId: string;
+	}) => {
+		if (actorId === targetUserId) {
+			throw new AppError(userErrors.cannotDeleteSelf, { service: SERVICE_NAME });
+		}
+
+		const targetUser = await this.usersRepository.findById(targetUserId);
+
+		if (targetUser.teamId !== actorTeamId) {
+			throw new AppError(userErrors.notOnTeam, { service: SERVICE_NAME });
+		}
+
+		if (targetUser.role.includes("demo")) {
+			throw new AppError(userErrors.demoUserProtected, { service: SERVICE_NAME });
+		}
+
+		const targetRoles = targetUser.role;
+
+		// Check actor can manage all of target's roles
+		for (const targetRole of targetRoles) {
+			const canManage = actorRoles.some((actorRole) => canManageRole(actorRole, targetRole));
+			if (!canManage) {
+				throw new AppError(userErrors.roleAboveCaller, { service: SERVICE_NAME });
+			}
+		}
+
+		await this.usersRepository.deleteById(targetUserId);
+
+		this.logger.info({ userId: targetUserId, actorId }, "User deleted");
+	};
+
+	getAllUsers = async () => {
+		return await this.usersRepository.findAll();
+	};
+
+	getUserById = async (roles: UserRole[], userId: string) => {
+		return await this.usersRepository.findById(userId);
+	};
+
+	editUserById = async (userId: string, patch: Partial<User>) => {
+		await this.usersRepository.updateById(userId, patch, null);
+	};
+
+	setPasswordByUserId = async (userId: string, password: string) => {
+		const hashedPassword = this.hashPassword(password);
+		const updatedUser = await this.usersRepository.updateById(userId, { password: hashedPassword }, null);
+		return updatedUser;
+	};
+}

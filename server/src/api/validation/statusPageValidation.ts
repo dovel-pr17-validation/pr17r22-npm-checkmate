@@ -1,0 +1,100 @@
+import { z } from "zod";
+import { publicIncidentSchema } from "@/domain/incidents/incident.schema.js";
+import { booleanCoercion, dnsHostnameRegex, timezoneValidation } from "./shared.js";
+import { StatusPageTypes, StatusPageThemes, StatusPageThemeModes, StatusPageRanges } from "@/domain/status-pages/status-page.type.js";
+import { normalizeStatusPageDomain } from "@/utils/statusPageDomain.js";
+import { cssReferencesExternalResource } from "@/utils/customCss.js";
+import { ImageMimeTypes } from "@/types/upload.js";
+import { statusPageSchema } from "@/domain/status-pages/status-page.schema.js";
+
+//****************************************
+// Status Page Validations
+//****************************************
+
+export const getStatusPageParamValidation = z.object({
+	url: z.string().min(1, "URL is required"),
+});
+
+export const getPublicMonitorIncidentsParamValidation = z.object({
+	url: z.string().min(1, "URL is required"),
+	monitorId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Must be a valid monitor ID"),
+});
+
+export const getPublicMonitorIncidentsQueryValidation = z.object({
+	date: z.string().date("Date must be a valid calendar date in YYYY-MM-DD format"),
+});
+
+export const getStatusPageQueryValidation = z.object({
+	type: z.union([z.enum(StatusPageTypes), z.array(z.enum(StatusPageTypes))]).transform((val) => (Array.isArray(val) ? val : [val])),
+	range: z.enum(StatusPageRanges).optional().default("latest"),
+});
+
+export const resolveStatusPageQueryValidation = getStatusPageQueryValidation.extend({
+	domain: z.string().optional(),
+});
+
+const customDomainValidation = z.preprocess(
+	(val) => {
+		if (val === undefined || val === null) {
+			return undefined;
+		}
+		return normalizeStatusPageDomain(String(val));
+	},
+	z.union([z.string().regex(dnsHostnameRegex, "Enter a valid domain name (e.g. status.example.com)"), z.null()]).optional()
+);
+
+export const createStatusPageBodyValidation = z
+	.object({
+		type: z.union([z.enum(StatusPageTypes), z.array(z.enum(StatusPageTypes))]).transform((val) => (Array.isArray(val) ? val : [val])),
+		companyName: z.string().min(1, "Company name is required"),
+		url: z.string().regex(/^[a-zA-Z0-9_-]+$/, {
+			message: "URL can only contain letters, numbers, underscores, and hyphens",
+		}),
+		customDomain: customDomainValidation,
+		timezone: timezoneValidation.optional(),
+		color: z.string().optional(),
+		monitors: z.array(z.string().regex(/^[0-9a-fA-F]{24}$/, "Must be a valid monitor ID")).min(1, "At least one monitor is required"),
+		subMonitors: z.array(z.string().regex(/^[0-9a-fA-F]{24}$/)).optional(),
+		deleteSubmonitors: z.boolean().optional(),
+		isPublished: booleanCoercion,
+		showCharts: booleanCoercion.optional(),
+		showUptimePercentage: booleanCoercion,
+		showAdminLoginLink: booleanCoercion.optional(),
+		showInfrastructure: booleanCoercion.optional(),
+		customCSS: z
+			.string()
+			.max(100000, "Custom CSS must be at most 100000 characters")
+			.refine((css) => !cssReferencesExternalResource(css), {
+				message: "Custom CSS cannot reference external URLs or use @import",
+			})
+			.optional(),
+		removeLogo: z.union([z.literal("true"), z.literal("false")]).optional(),
+		theme: z.enum(StatusPageThemes).optional(),
+		themeMode: z.enum(StatusPageThemeModes).optional(),
+	})
+	.strip();
+
+export const imageValidation = z
+	.object({
+		fieldname: z.string().min(1, "Field name is required"),
+		originalname: z.string().min(1, "Original name is required"),
+		encoding: z.string().min(1, "Encoding is required"),
+		mimetype: z.enum(ImageMimeTypes, {
+			message: "File must be a valid image (jpeg, jpg, or png)",
+		}),
+		size: z.number().max(3145728, "File size must be less than 3MB"),
+		buffer: z.instanceof(Buffer, { message: "Buffer is required" }),
+		destination: z.string().optional(),
+		filename: z.string().optional(),
+		path: z.string().optional(),
+	})
+	.refine((data) => data.buffer, {
+		message: "Image file is required",
+	});
+
+export const statusPageIdParamValidation = z.object({
+	id: z.string().min(1, "Status page ID is required"),
+});
+
+export const publicMonitorIncidentsResponseSchema = z.object({ incidents: z.array(publicIncidentSchema) });
+export const statusPageListResponseSchema = z.array(statusPageSchema);
